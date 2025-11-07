@@ -141,7 +141,7 @@ class LogValidator:
 
 
     BANNED_TEXT_PATTERNS = {
-        #  Common offensive or placeholder terms
+        #  Common prohibited_words or placeholder terms
         'prohibited_words': r'\b(dummy|test123|xyzpassword|foobar|loremipsum|tempuser|testuser|sampleuser)\b',
 
         #  Hardcoded credentials or passwords
