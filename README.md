@@ -19,7 +19,8 @@ import re
 import json
 import hashlib
 import logging
-from datetime import datetime
+
+from datetime import datetime, timezone
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass, field
 from enum import Enum
@@ -141,7 +142,7 @@ class LogValidator:
 
     BANNED_TEXT_PATTERNS = {
         #  Common offensive or placeholder terms
-        'offensive_terms': r'\b(dummy|test123|xyzpassword|foobar|loremipsum|tempuser|testuser|sampleuser)\b',
+        'prohibited_words': r'\b(dummy|test123|xyzpassword|foobar|loremipsum|tempuser|testuser|sampleuser)\b',
 
         #  Hardcoded credentials or passwords
         'hardcoded_passwords': r'(?i)password\s*=\s*[\'"].+[\'"]',
@@ -352,7 +353,9 @@ class LogValidator:
             ValidationResult with validation status and issues
         """
         log_id = hashlib.sha256(log_text.encode()).hexdigest()[:16]
-        timestamp = datetime.utcnow().isoformat() + "Z"
+        timestamp = datetime.now(timezone.utc).isoformat()
+       
+
         issues = []
         
         # Input validation
@@ -741,3 +744,6 @@ if __name__ == "__main__":
     if result.sanitized_log:
         print("\n=== Sanitized Log ===")
         print(result.sanitized_log)
+
+        
+
